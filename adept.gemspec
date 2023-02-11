@@ -8,7 +8,7 @@ Gem::Specification.new do |spec|
   spec.authors = ["Rory Dudley"]
   spec.email = ["rory.dudley@gmail.com"]
 
-  spec.summary = "Active Directory Extra Package Tools"
+  spec.summary = "Active directory extra package tools (for Linux)."
   spec.description = "Extra tools to help manage active directory users on Linux."
   spec.homepage = "https://github.com/nysnacks/adept"
   spec.license = "MIT"
