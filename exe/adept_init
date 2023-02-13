@@ -1,0 +1,167 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+require "socket"
+require 'io/console'
+
+# Make sure we run with super user privileges, also start in home directory
+user = `whoami`.strip
+if user != "root"
+  puts "adept_init: Please run this script with super user privileges"
+  exit 1
+end
+Dir.chdir ENV["HOME"]
+
+# Get input from user on options to configure the domain controller
+#
+# Variables:
+#   fqdn          Fully qualified domain name of the domain controller (i.e. dc1.example.com), we'll use this to extrapolate other values
+#   hostname      The first part of the FQDN (the actual name of the domain controller, i.e. dc1)
+#   realm         The kerberos realm, which is the part in the FQDN after the hostname, all uppercase
+#   domain        Workgroup (typically take from a string in the FQDN, but can realistically be whatever)
+#   dns           The DNS backend for samba (SAMBA_INTERNAL, BIND9_FLATFILE, BIND9_LMZ, NONE)
+#   password      Domain administrator password
+#
+print "Enter the FQDN for the domain controller (i.e. dc1.example.com): "
+fqdn = gets.chomp
+hostname = fqdn.split(".")[0]
+realm = fqdn.split(".")[1..].join(".").upcase
+domain = realm.split(".")[0]
+print "Enter the netbios domain [#{domain}]: "
+domain_input = gets.chomp
+domain = domain_input unless domain_input.empty?
+dns = "SAMBA_INTERNAL"
+print "Enter the DNS backend for samba [#{dns}]: "
+dns_input = gets.chomp
+dns = dns_input unless dns_input.empty?
+
+password = ""
+while password.empty?
+  print "Enter the password for the domain administrator: "
+  password = STDIN.noecho(&:gets).chomp
+  puts ""
+end
+
+print "Re-enter domain administrator password: "
+repassword = STDIN.noecho(&:gets).chomp
+puts ""
+
+if password != repassword
+  puts "adept_init: Passwords do not match"
+  exit 1
+end
+
+# Enable codeready-builder repo
+puts "== adept_init: Enable codeready-builder repository =="
+`subscription-manager repos --enable codeready-builder-for-rhel-9-x86_64-rpms`
+
+# Install dependencies
+puts "== adept_init: Install dependencies =="
+`yum -y install docbook-style-xsl gcc gdb gnutls-devel gpgme-devel jansson-devel keyutils-libs-devel krb5-workstation libacl-devel libaio-devel libarchive-devel libattr-devel libblkid-devel libtasn1 libtasn1-tools libxml2-devel libxslt lmdb-devel openldap-devel pam-devel perl perl-ExtUtils-MakeMaker perl-Parse-Yapp popt-devel python3-cryptography python3-dns python3-gpg python3-devel readline-devel rpcgen systemd-devel tar flex bison dbus dbus-devel python3-markdown zlib-devel`
+
+# Install JSON module for perl
+`cpan install JSON`
+
+# Download and extract samba
+puts "== adept_init: Download and extract samba =="
+# TODO: Grab the latest version, instead of a hardcoded version
+`curl -LO https://download.samba.org/pub/samba/stable/samba-4.17.5.tar.gz`
+`tar xzvf samba-4.17.5.tar.gz`
+Dir.chdir "samba-4.17.5"
+
+# Configure, build, and install samba
+puts "== adept_init: Build and install samba =="
+`./configure`
+`make -j4`
+`make install`
+
+# Set the hostname
+`hostnamectl hostname #{fqdn}`
+
+# SELinux stuff
+puts "== adept_init: Fix SELinux perms for samba =="
+`setsebool -P samba_create_home_dirs=on samba_domain_controller=on samba_enable_home_dirs=on samba_portmapper=on use_samba_home_dirs=on`
+`restorecon -Rv /`
+
+# Allow active directory ports in firewall
+puts "== adept_init: Setup active directory ports in the firewall =="
+`firewall-cmd --permanent --add-port={53/udp,53/tcp,88/udp,88/tcp,123/udp,135/tcp,137/udp,138/udp,139/tcp,389/udp,389/tcp,445/tcp,464/udp,464/tcp,636/tcp,3268/tcp,3269/tcp,49152-65535/tcp}`
+`firewall-cmd --reload`
+
+# Writing default config files
+# TODO: Clean up these files, maybe use better defaults?
+puts "== adept_init: Writing config files =="
+ip_addr = Socket.ip_address_list.filter{|a| a.ip_address.include? "192"}.first.ip_address
+
+# /etc/systemd/resolved.conf.d/custom.conf
+# TODO: Need a better solution for the DNS IP, though this solution works for my network
+resolved_custom_conf = %{[Resolve]
+DNSStubListener=no
+Domains=#{realm.downcase}
+DNS=#{ip_addr}
+}
+Dir.mkdir("/etc/systemd/resolved.conf.d") unless Dir.exist?("/etc/systemd/resolved.conf.d")
+File.open("/etc/systemd/resolved.conf.d/custom.conf", "w") {|f| f.write(resolved_custom_conf)}
+
+# /etc/krb5.conf.d/samba-dc
+krb5_samba_dc = %{[libdefaults]
+  default_realm = #{realm}
+  dns_lookup_realm = false
+  dns_lookup_kdc = true
+
+[realms]
+#{realm} = {
+  default_domain = #{domain}
+}
+
+[domain_realm]
+  #{fqdn} = #{realm}
+}
+File.open("/etc/krb5.conf.d/samba-dc", "w") {|f| f.write(krb5_samba_dc)}
+
+# /etc/samba/smb.conf
+smb_conf = %{[global]
+  dns forwarder = 1.1.1.1
+  netbios name = #{hostname.upcase}
+  realm = #{realm}
+  server role = active directory domain controller
+  workgroup = #{domain}
+  idmap_ldb:use rfc2307 = yes
+
+[sysvol]
+  path = /var/lib/samba/sysvol
+  read only = No
+
+[netlogon]
+  path = /var/lib/samba/sysvol/#{realm.downcase}/scripts
+  read only = No
+}
+File.open("/etc/samba/smb.conf", "w") {|f| f.write(smb_conf)}
+
+# /etc/systemd/system/samba.service
+samba_service = %{[Unit]
+Description=Samba Active Directory Domain Controller
+After=network.target remote-fs.target nss-lookup.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/samba/sbin/samba -D
+PIDFile=/usr/local/samba/var/run/samba.pid
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target
+}
+File.open("/etc/systemd/system/samba.service", "w") {|f| f.write(samba_service)}
+`systemctl daemon-reload`
+
+# /etc/hosts
+File.open("/etc/hosts", "a") {|f| f.write("\n#{ip_addr}\t#{hostname} #{fqdn}")}
+
+# Provision the active directory server
+puts "== adept_init: Provisioning samba active directory =="
+`/usr/local/samba/bin/samba-tool domain provision --server-role=dc --use-rfc2307 --dns-backend=#{dns} --realm=#{realm} --domain=#{domain} --adminpass=#{password}`
+
+# Finishing up
+puts "Samba should now be installed and ready to go!"
+puts "Please reboot your system, then you may run \`systemctl enable --now samba\`."
+puts "You may want to \`echo 'export PATH=/usr/local/samba/bin/:/usr/local/samba/sbin/:$PATH' >> ~/.bashrc && source ~/.bashrc\`, so that you have access to the samba tools."
